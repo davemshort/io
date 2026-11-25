@@ -12,9 +12,11 @@ There are no additional runtime dependencies or telemetry in io.
 
 ## Install and upgrade
 
-From a trusted copy of this source tree, run:
+Open Terminal, then clone the repository over HTTPS and install io.
 
 ```sh
+git clone https://github.com/davemshort/io.git
+cd io
 sudo ./scripts/install.sh
 io doctor
 io version
