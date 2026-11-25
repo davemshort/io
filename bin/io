@@ -1,0 +1,1074 @@
+#!/bin/zsh -f
+# io Installomator frontend
+emulate -L zsh
+setopt extendedglob pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C
+umask 077
+
+readonly prefix=${0:A:h:h}
+source "$prefix/lib/trust.zsh" || exit 1
+readonly default_engine=/usr/local/Installomator/Installomator.sh
+readonly config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/io
+readonly cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/io
+readonly registry=$config_dir/apps.txt cache=$cache_dir/labels.txt
+readonly label_pattern='^[a-z0-9][a-z0-9._-]*$'
+typeset engine engine_version catalog_key catalog_source outcome scratch
+typeset -a labels registered
+trap '[[ -z $scratch ]] || /bin/rm -f -- "$scratch"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+use_color() { [[ -t $1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; }
+
+set_output_marker() {
+    REPLY="${3:-==>}"
+    if use_color "$1"; then
+        REPLY=$'\e[1;'${2}m$REPLY$'\e[0m'
+    fi
+}
+
+message() {
+    local fd=$1 REPLY
+    set_output_marker "$@"
+    shift 3
+    print -ru "$fd" -- "$REPLY $*"
+}
+status() { message 1 34 '==>' "$@"; }
+success() { message 1 32 '==>' "$@"; }
+progress() { message 2 34 '==>' "$@"; }
+warn() { message 2 33 '==> Warning:' "$@"; }
+error() { message 2 31 '==> Error:' "$@"; }
+die() { error "$@"; exit 1; }
+usage_error() { error "$* (see io help)"; exit 2; }
+
+help_text() {
+    cat <<'HELP'
+Usage: io <command> [argument]
+
+  search <query>  Find labels by substring (case-insensitive)
+  available       List catalog labels
+  info <label>    Show catalog and registry details
+  install <label> … Install and register one or more applications
+  update <label>  Update a registered application
+  update --all    Update every registered application
+  list            List registered applications
+  list --installed Show local presence and versions for registered applications
+  outdated [label] Check registered apps for newer stable versions
+  add <label>     Register an application without installing it
+  remove <label>  Deregister an application
+  replace <cask> … Review selected casks (--dry-run to preview, -y to proceed)
+  replace --all   Review a bulk migration (--exclude <cask>, --map <cask>=<label>)
+  upgrade-engine  Upgrade Installomator from its stable release (--check or -y)
+  refresh         Refresh the catalog
+  doctor          Check the configuration, engine, and local state
+  version         Print io and Installomator versions
+  help            Show this help
+
+  io <label>      Shorthand for io install <label>
+  --help, -h      Show this help
+  --version       Print versions
+HELP
+}
+
+valid_label() {
+    [[ $1 =~ $label_pattern && ${#1} -le 128 ]] || return 1
+    case $1 in
+        version|longversion|valuesfromarguments) return 1 ;;
+    esac
+    return 0
+}
+
+load_config() {
+    engine=$default_engine
+    local file=$config_dir/config line seen=0
+    [[ -e $file || -L $file ]] || return 0
+    [[ -f $file && -r $file ]] || die "Cannot read $file."
+    while IFS= read -r line || [[ -n $line ]]; do
+        case $line in
+            [[:blank:]]#|[[:blank:]]#\#*) ;;
+            installomator_path=/*)
+                (( !seen )) || die "Duplicate installomator_path in $file."
+                engine=${line#*=}
+                [[ $engine != *[[:cntrl:]]* ]] || die "Invalid engine path in $file."
+                seen=1
+                ;;
+            *) die "Invalid configuration in $file. Use installomator_path=/absolute/path." ;;
+        esac
+    done < "$file" || die "Cannot read $file."
+}
+
+# Read version metadata without executing the configured file.
+inspect_engine() {
+    [[ -x $engine && -f $engine ]] || { error "Installomator is unavailable at $engine."; return 1; }
+    engine=${engine:A}
+    [[ $engine != *[[:cntrl:]]* ]] || return 1
+    engine_version=$(/usr/bin/sed -nE 's/^VERSION="([0-9]+(\.[0-9]+)+)"[[:blank:]]*$/\1/p' "$engine") || return 1
+    local version_pattern='^[0-9]+(\.[0-9]+)+$'
+    [[ $engine_version =~ $version_pattern ]] || {
+        error "Cannot identify a stable Installomator version at $engine."
+        return 1
+    }
+}
+
+# Read the generated case table as data. Support simple literal aliases separated by pipes.
+local_catalog() {
+    /usr/bin/awk -v metadata="${1:-0}" '
+        function flush(    i, key) {
+            if (metadata) {
+                if (fields["cli"] && !fields["installedApp"]) fields["appName"] = "?"
+                for (i = 1; i <= count; i++)
+                    print aliases[i] "|" fields["name"] "|" fields["appName"] "|" fields["packageID"] "|" fields["installedApp"]
+            }
+            for (key in fields) delete fields[key]
+            count = 0
+        }
+        /^case \$label in[[:blank:]]*$/ { table = 1; next }
+        table && /^# label descriptions start here[[:blank:]]*$/ { apps = 1; next }
+        apps && /^\*\)[[:blank:]]*$/ { flush(); complete = 1; exit }
+        table && /^esac[[:blank:]]*$/ { exit }
+        apps && /^[a-z0-9][a-z0-9._|-]*\|\\$/ {
+            continued = continued substr($0, 1, length($0) - 1)
+            next
+        }
+        apps && /^[a-z0-9][a-z0-9._|-]*\)[[:blank:]]*$/ {
+            flush()
+            sub(/\)[[:blank:]]*$/, "")
+            count = split(continued $0, aliases, /\|/)
+            if (!metadata) for (i = 1; i <= count; i++) print aliases[i]
+        }
+        metadata && count && /^[[:blank:]]*(name|appName|packageID)=/ {
+            line = $0
+            sub(/^[[:blank:]]+/, "", line)
+            key = substr(line, 1, index(line, "=") - 1)
+            value = substr(line, length(key) + 2)
+            sub(/[[:blank:]]+$/, "", value)
+            if (value ~ /^"[^"]+"$/) value = substr(value, 2, length(value) - 2)
+            if (value !~ /^[[:alnum:] ._+&()-]+$/ || (key in fields && fields[key] != value))
+                value = "?"
+            fields[key] = value
+        }
+        metadata && count && /^[[:blank:]]*CLIInstaller=/ { fields["cli"] = 1 }
+        metadata && count && /^[[:blank:]]*appCustomVersion[[:blank:]]*\(\)/ {
+            line = $0
+            while (match(line, /"\/Applications\/(Utilities\/)?[[:alnum:] ._+&()-]+\.app\/Contents\/Info\.plist"/)) {
+                value = substr(line, RSTART, RLENGTH)
+                line = substr(line, RSTART + RLENGTH)
+                sub(/^"\/Applications\/(Utilities\/)?/, "", value)
+                sub(/\/Contents\/Info\.plist"$/, "", value)
+                if ("installedApp" in fields && fields["installedApp"] != value) value = "?"
+                fields["installedApp"] = value
+            }
+        }
+        { continued = "" }
+        END { if (!complete) exit 1 }
+    ' "$engine"
+}
+
+installed_inventory() {
+    local metadata label name app package installed_app entry root plist version presence count version_source
+    local -A records
+    if inspect_engine && metadata=$(local_catalog 1); then
+        for entry in "${(@f)metadata}"; do
+            records[${entry%%|*}]=${entry#*|}
+        done
+    else
+        warn "Local Installomator label metadata unavailable."
+    fi
+    for label in "${registered[@]}"; do
+        entry=${records[$label]}
+        IFS='|' read -r name app package installed_app <<< "$entry"
+        [[ -z $installed_app ]] || app=$installed_app
+        [[ -n $app ]] || { [[ -z $name || $name == '?' ]] || app="$name.app"; }
+        version=-
+        version_source=-
+        presence=Unknown
+        count=0
+        if [[ -n $app && $app != '?' && $app == *.app ]]; then
+            presence='Not found'
+            for root in /Applications /Applications/Utilities "$HOME/Applications"; do
+                plist="$root/$app/Contents/Info.plist"
+                [[ -f $plist ]] || continue
+                if /usr/bin/plutil -extract CFBundleIdentifier raw -expect string "$plist" >/dev/null 2>&1; then
+                    (( count += 1 ))
+                    if version=$(/usr/bin/plutil -extract CFBundleShortVersionString raw -expect string "$plist" 2>/dev/null); then
+                        version_source=short
+                    else
+                        version=$(/usr/bin/plutil -extract CFBundleVersion raw "$plist" 2>/dev/null) || version=-
+                        version_source=build
+                    fi
+                else
+                    presence=Unknown
+                fi
+            done
+        fi
+        if (( count == 1 )); then
+            presence=Installed
+        elif (( count > 1 )); then
+            presence=Unknown
+            version=-
+        elif [[ $package =~ '^[A-Za-z0-9][A-Za-z0-9._-]+$' ]] &&
+            version=$(/usr/sbin/pkgutil --pkg-info-plist "$package" 2>/dev/null |
+                /usr/bin/plutil -extract pkg-version raw - 2>/dev/null); then
+            presence='Receipt only'
+        fi
+        [[ -n $version && $version != *[[:cntrl:]\|]* ]] || version=-
+        printf '%s|%s|%s|%s\n' "$label" "$presence" "$version" "$version_source"
+    done
+}
+
+latest_app_version() (
+    local url field repo json release
+    case $1 in
+        rectangle) repo=rxhanson/Rectangle ;;
+        betterdisplay) repo=waydabber/BetterDisplay ;;
+        drawio) repo=jgraph/drawio-desktop ;;
+        keka) repo=aonez/Keka ;;
+        joplin) repo=laurent22/joplin ;;
+        markdownpreview) repo=pluk-inc/markdown-preview ;;
+        sloth) repo=sveinbjornt/Sloth ;;
+        vorssaint) repo=vorssaint/vorssaint-utils ;;
+        shottr) url=https://shottr.cc/api/version.json field=latestVersion ;;
+        obsidian)
+            url=https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/desktop-releases.json
+            field=latestVersion ;;
+        visualstudiocode) url=https://update.code.visualstudio.com/api/releases/stable field=0 ;;
+        *) return 2 ;;
+    esac
+    if [[ -n $repo ]]; then
+        url="https://api.github.com/repos/$repo/releases/latest"
+        field=tag_name
+    fi
+    json=$(/usr/bin/curl -qfsL --proto '=https' --proto-redir '=https' --connect-timeout 3 --max-time 6 \
+        --max-filesize 1048576 "$url" 2>/dev/null) || return 1
+    release=$(/usr/bin/plutil -extract "$field" raw -expect string - 2>/dev/null <<< "$json") || return 1
+    print -r -- "${release#v}"
+)
+
+report_installed() {
+    local mode=$1 filter=${2:-} inventory label presence version version_source latest result rc
+    local -i outdated=0 checked=0 unknown=0 missing=0
+    local version_pattern='^[0-9]{1,8}(\.[0-9]{1,8}){1,5}$'
+    load_registry || return 1
+    if [[ -n $filter ]]; then
+        has_registered_label "$filter" || die "$filter is not registered."
+        registered=("$filter")
+    fi
+    if (( ! ${#registered} )); then
+        status 'No registered applications.'
+        return 0
+    fi
+    inventory=$(installed_inventory) || return 1
+    if [[ $mode == list ]]; then
+        printf '%-24s %-12s %s\n' LABEL STATUS VERSION
+    else
+        autoload -Uz is-at-least
+        printf '%-24s %-16s %-18s %s\n' LABEL INSTALLED LATEST STATUS
+    fi
+    while IFS='|' read -r label presence version version_source; do
+        if [[ $mode == list ]]; then
+            printf '%-24s %-12s %s\n' "$label" "$presence" "$version"
+            continue
+        fi
+        latest=-
+        if [[ $presence == 'Not found' ]]; then
+            result=$presence
+            (( missing += 1 ))
+        elif [[ $presence != Installed || $version_source != short || ! $version =~ $version_pattern ]]; then
+            result='Unknown (installed version unavailable or incompatible)'
+            (( unknown += 1 ))
+        else
+            rc=0
+            latest=$(latest_app_version "$label") || rc=$?
+            if (( rc )) || [[ ! $latest =~ $version_pattern ]]; then
+                latest=-
+                result='Unknown (release lookup unavailable)'
+                (( rc != 2 )) || result='Unknown (no release source)'
+                (( unknown += 1 ))
+            else
+                (( checked += 1 ))
+                if is-at-least "$latest" "$version"; then
+                    result='Up to date'
+                else
+                    result=Outdated
+                    (( outdated += 1 ))
+                fi
+            fi
+        fi
+        printf '%-24s %-16s %-18s %s\n' "$label" "$version" "$latest" "$result"
+    done <<< "$inventory"
+    if [[ $mode == outdated ]]; then
+        status "$outdated outdated, $(( checked - outdated )) up to date, $unknown unknown, $missing not found."
+    fi
+}
+
+read_catalog() {
+    local file=$1 expected=$2 header line
+    local -a entries
+    [[ -f $file && -r $file ]] || return 1
+    {
+        IFS= read -r header && [[ $header == "$expected" ]] || return 1
+        while IFS= read -r line; do
+            valid_label "$line" || return 1
+            entries+=("$line")
+        done
+        [[ -z $line ]] || return 1
+    } < "$file"
+    (( ${#entries} && ${#entries} == ${#${(@u)entries}} )) || return 1
+    labels=("${entries[@]}")
+}
+
+refresh_catalog() {
+    local data line tag key
+    local -a entries
+    if [[ $catalog_key != release ]]; then
+        if data=$(local_catalog) && [[ -n $data ]]; then
+            catalog_source="local Installomator $engine_version"
+            key="local $catalog_key"
+        else
+            tag=v$engine_version
+            catalog_source="Installomator $tag catalog"
+            key="upstream $catalog_key"
+        fi
+    else
+        tag=release
+        catalog_source='upstream stable catalog (engine unavailable)'
+        key='upstream release'
+    fi
+    if [[ -n $tag ]]; then
+        data=$(/usr/bin/curl -q --fail --silent --show-error --location --proto '=https' \
+            --proto-redir '=https' --connect-timeout 5 --max-time 20 --max-filesize 1048576 \
+            "https://raw.githubusercontent.com/Installomator/Installomator/$tag/Labels.txt") || return 1
+    fi
+    for line in "${(@f)data}"; do
+        case $line in
+            version|longversion|valuesfromarguments) continue ;;
+        esac
+        valid_label "$line" || { error "Invalid catalog content."; return 1; }
+        entries+=("$line")
+    done
+    (( ${#entries} )) || return 1
+    /bin/mkdir -p -- "$cache_dir" || return 1
+    scratch=$(/usr/bin/mktemp "$cache_dir/.labels.XXXXXXXX") || return 1
+    {
+        print -r -- "$key"
+        print -rl -- "${(@ou)entries}"
+    } > "$scratch" && /bin/mv -fh -- "$scratch" "$cache" || return 1
+    scratch=
+    labels=("${(@ou)entries}")
+}
+
+load_catalog() {
+    local force=${1:-0}
+    catalog_key=release
+    if [[ -e $engine || -L $engine ]]; then
+        inspect_engine || return 1
+        catalog_key=$(/usr/bin/stat -f '%d:%i:%z:%m:%c' "$engine") || return 1
+        catalog_key+=" $engine_version $engine"
+    fi
+    if (( !force )); then
+        if read_catalog "$cache" "local $catalog_key"; then
+            catalog_source="local Installomator $engine_version"
+            return 0
+        fi
+        if read_catalog "$cache" "upstream $catalog_key"; then
+            if [[ $catalog_key == release ]]; then
+                catalog_source='upstream stable catalog (engine unavailable)'
+            else
+                catalog_source="Installomator v$engine_version catalog"
+            fi
+            return 0
+        fi
+    fi
+    refresh_catalog || { error "Could not refresh the catalog. Any existing cache was preserved."; return 1; }
+}
+
+has_catalog_label() {
+    (( ${labels[(Ie)$1]} ))
+}
+
+load_registry() {
+    registered=()
+    local line
+    [[ -e $registry || -L $registry ]] || return 0
+    [[ -f $registry && -r $registry ]] || { error "Cannot read $registry."; return 1; }
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line ]] && continue
+        valid_label "$line" || { error "Invalid label in $registry."; return 1; }
+        registered+=("$line")
+    done < "$registry" || return 1
+    registered=("${(@u)registered}")
+}
+
+has_registered_label() {
+    (( ${registered[(Ie)$1]} ))
+}
+
+# Lock a separate inode so atomic replacement never invalidates the lock.
+change_registry() (
+    local action=$1 label=$2 lock=$config_dir/.registry.lock lock_fd temporary=
+    [[ $action != remove || -e $registry || -L $registry ]] || return 0
+    /bin/mkdir -p -- "$config_dir" || return 1
+    zmodload zsh/system || return 1
+    [[ ! -L $lock && ( ! -e $lock || -f $lock ) ]] || return 1
+    ( setopt noclobber; : > "$lock" ) 2>/dev/null || [[ -f $lock && ! -L $lock ]] || return 1
+    zsystem flock -t 10 -f lock_fd "$lock" || return 1
+    trap '[[ -z $temporary ]] || /bin/rm -f -- "$temporary"' EXIT
+    load_registry || return 1
+    case $action in
+        add) has_registered_label "$label" || registered+=("$label") ;;
+        remove) registered=("${(@)registered:#$label}") ;;
+    esac
+    temporary=$(/usr/bin/mktemp "$config_dir/.apps.XXXXXXXX") || return 1
+    if (( ${#registered} )); then
+        print -rl -- "${registered[@]}" > "$temporary" || return 1
+    fi
+    /bin/mv -fh -- "$temporary" "$registry" || return 1
+    temporary=
+)
+
+deployment_ready() {
+    inspect_engine || return 1
+    trusted_path "$engine" || {
+        error "Refusing to elevate $engine. The script and its resolved parents must be root-owned and protected from non-root writes."
+        return 1
+    }
+    [[ -x /usr/bin/sudo ]] || { error "sudo is unavailable."; return 1; }
+}
+
+deployment_label_allowed() {
+    # These workflows can terminate Acrobat Updater before the blocking-process check.
+    case $1 in adobereaderdc|adobereaderdc-install|adobereaderdc-update) return 1 ;; esac
+    return 0
+}
+
+run_engine() {
+    local label=$1 rc=0 action=Updating
+    local heading_color= step_color= progress_reset=
+    local -a sudo_flags pipeline_status
+    outcome=failed
+    has_catalog_label "$label" || { error "$label: label unavailable in this catalog."; return 1; }
+    if ! deployment_label_allowed "$label"; then
+        outcome=skipped
+        warn "$label: Skipped because this Installomator workflow can terminate Acrobat Updater."
+        return 3
+    fi
+    trusted_path "$engine" || { error "$label: Installomator path no longer passes trust checks."; return 1; }
+    [[ -t 0 ]] || sudo_flags=(-n)
+    scratch=$(/usr/bin/mktemp /private/tmp/io-run.XXXXXXXX) || return 1
+    [[ $command_name == update ]] || action=Installing
+    [[ $command_name != replace ]] || action="io: $action"
+    if use_color 2; then
+        heading_color=$'\e[1;32m'
+        step_color=$'\e[1;34m'
+        progress_reset=$'\e[0m'
+    fi
+    printf '%s==>%s %s %s%s%s\n' "$heading_color" "$progress_reset" \
+        "$action" "$heading_color" "$label" "$progress_reset" >&2
+    /usr/bin/sudo "${sudo_flags[@]}" -- "$engine" "$label" DEBUG=0 NOTIFY=silent \
+        BLOCKING_PROCESS_ACTION=silent_fail INSTALL= LOGGING=INFO 2>&1 |
+        /usr/bin/tee "$scratch" |
+        /usr/bin/awk -F ' +: +' -v app="$label" -v marker="${step_color}==>${progress_reset}" '
+            $3 == app {
+                if ($4 ~ /^Downloading /) step = "Downloading installer"
+                else if ($4 ~ /^Mounting /) step = "Mounting installer image"
+                else if ($4 ~ /^Verifying:/) step = "Verifying installer"
+                else if ($4 ~ /^App needs to be updated and uses /) step = "Running vendor updater"
+                else if ($4 ~ /^Installing /) step = "Preparing installation"
+                else next
+                if (!seen[step]++) {
+                    print marker " " step
+                    fflush()
+                }
+            }
+        ' >&2
+    pipeline_status=("${pipestatus[@]}")
+    rc=$pipeline_status[1]
+    if (( pipeline_status[2] || pipeline_status[3] )); then
+        error "$label: Could not capture Installomator output. Check the engine log for the result."
+        /bin/rm -f -- "$scratch"
+        scratch=
+        return 1
+    fi
+    case $rc in
+        0)
+            outcome=$(/usr/bin/awk -F ' +: +' -v app="$label" '
+                BEGIN { outcome = "unknown" }
+                { sub(/\r$/, "") }
+                NF == 4 && $3 == app {
+                    if ($2 == "REQ" && ($4 == "No newer version." || $4 == "No new version to install"))
+                        outcome = "current"
+                    else if ($2 == "INFO" && $4 ~ /^Downloaded version of .+, same as installed\.$/)
+                        outcome = "current"
+                    else if ($2 == "REQ" && $4 == "All done!")
+                        outcome = "completed"
+                }
+                END { print outcome }
+            ' "$scratch") || outcome=unknown
+            ;;
+        12|23|24|75) outcome=skipped ;;
+    esac
+    case $outcome in
+        completed) success "$label: Deployment completed" ;;
+        current) success "$label: Already current" ;;
+        unknown) message 1 33 '==> Warning:' "$label: Outcome unknown (Installomator exited 0)" ;;
+        skipped) warn "$label: Skipped (Installomator exit $rc)." ;;
+        failed)
+            error "$label: Failed (sudo or Installomator exit $rc)."
+            /bin/cat "$scratch" >&2
+            ;;
+    esac
+    /bin/rm -f -- "$scratch"
+    scratch=
+    case $outcome in
+        completed|current) return 0 ;;
+        unknown|skipped) return 3 ;;
+        *) return 1 ;;
+    esac
+}
+
+deploy_app() {
+    local label=$1
+    run_engine "$label" || return $?
+    if [[ $command_name == install ]] && ! change_registry add "$label"; then
+        outcome=failed
+        error "$label: Deployment finished, but the registry could not be updated."
+        return 1
+    fi
+}
+
+deploy_batch() {
+    local label
+    local -A counts=(completed 0 current 0 unknown 0 skipped 0 failed 0)
+    for label in "$@"; do
+        deploy_app "$label"
+        (( counts[$outcome] += 1 ))
+    done
+    status "Summary: $counts[completed] completed, $counts[current] current, $counts[skipped] skipped, $counts[failed] failed, $counts[unknown] unknown."
+    (( counts[failed] == 0 )) || return 1
+    (( counts[skipped] + counts[unknown] == 0 )) || return 3
+}
+
+migrate_cask() (
+    local brew=$1 cask=$2 target=$3 recovery=1
+    trap '
+        [[ -z $scratch ]] || /bin/rm -f -- "$scratch"
+        if (( recovery )); then error "$cask: Replacement stopped. To restore the cask, run: brew install --cask $cask"; fi
+    ' EXIT
+    message 2 33 '==>' "Homebrew: Removing cask $cask"
+    "$brew" uninstall --cask "$cask" || exit 1
+    print -u2
+    run_engine "$target" || exit $?
+    recovery=0
+    change_registry add "$target" || die "$target was deployed, but registration failed. Run: io add $target"
+)
+
+valid_cask() {
+    local pattern='^[a-z0-9][a-z0-9._@+-]*$'
+    [[ $1 =~ $pattern && ${#1} -le 128 ]]
+}
+
+suggest_replacement_labels() {
+    local token=${1//[^a-z0-9]/} candidate normalized
+    local -a equivalent prefixes contained suggestions
+    (( ${#token} >= 3 )) || return 0
+    for candidate in "${labels[@]}"; do
+        deployment_label_allowed "$candidate" || continue
+        normalized=${candidate//[^a-z0-9]/}
+        case $normalized in
+            "$token") equivalent+=("$candidate") ;;
+            "$token"*) prefixes+=("$candidate") ;;
+            *"$token"*) contained+=("$candidate") ;;
+        esac
+    done
+    suggestions=("${equivalent[@]}" "${prefixes[@]}" "${contained[@]}")
+    print -rl -- "${(@)suggestions[1,8]}"
+}
+
+choose_replacement_label() {
+    local cask=$1 assume_yes=$2 matches answer index
+    local -a candidates
+    matches=$(suggest_replacement_labels "$cask")
+    [[ -n $matches ]] || { error "No deployable Installomator label for $cask."; return 1; }
+    candidates=("${(@f)matches}")
+    progress "No exact Installomator label for $cask. Possible matches:"
+    for (( index = 1; index <= ${#candidates}; index++ )); do
+        printf '  %d) %s\n' "$index" "$candidates[$index]" >&2
+    done
+    if (( assume_yes )) || [[ ! -t 0 || ! -t 2 ]]; then
+        error "Choose a label explicitly: io replace $cask --label <label>"
+        return 1
+    fi
+    while true; do
+        printf 'Choose a label (Enter to cancel): ' >&2
+        if ! read -r answer || [[ -z $answer ]]; then
+            status 'Replacement cancelled.'
+            return 2
+        fi
+        if [[ $answer == [1-8] ]] && (( answer <= ${#candidates} )); then
+            REPLY=$candidates[$answer]
+            return 0
+        fi
+        warn 'Enter a number from the list.'
+    done
+}
+
+preview_cask_removals() (
+    local brew=$1 marker=$2 metadata
+    shift 2
+    metadata=$(/usr/bin/mktemp /private/tmp/io-cask-info.XXXXXXXX) || exit 1
+    trap '/bin/rm -f -- "$metadata"' EXIT
+    HOMEBREW_NO_AUTO_UPDATE=1 "$brew" info --cask --json=v2 --installed > "$metadata" || exit 1
+    /usr/bin/osascript -l JavaScript - "$metadata" "$marker" "$@" <<'JXA'
+ObjC.import('Foundation')
+function run(args) {
+    const json = $.NSString.stringWithContentsOfFileEncodingError(args[0], $.NSUTF8StringEncoding, null)
+    const casks = JSON.parse(ObjC.unwrap(json)).casks
+    const lines = [args[1] + ' Homebrew uninstall preview (declared actions)']
+    const actionNames = new Map([
+        ['launchctl', 'Remove launch service'],
+        ['quit', 'Quit app'],
+        ['kext', 'Unload kernel extension'],
+        ['delete', 'Delete'],
+        ['trash', 'Move to Trash'],
+        ['rmdir', 'Remove directory'],
+        ['pkgutil', 'Remove package'],
+        ['script', 'Run uninstall script'],
+        ['signal', 'Signal process'],
+        ['login_item', 'Remove login item'],
+    ])
+    for (const token of args.slice(2)) {
+        const cask = casks.find(item => item.token === token)
+        const actions = []
+        for (const artifact of (cask && cask.artifacts) || []) {
+            for (const kind of ['app', 'binary', 'command_wrapper']) {
+                if (!artifact[kind]) continue
+                const subject = artifact.target || artifact[kind][0]
+                actions.push((kind === 'app' ? 'Remove app ' : 'Remove CLI entry ') + JSON.stringify(subject))
+            }
+            for (const action of artifact.uninstall || []) {
+                if (!action || typeof action !== 'object') continue
+                for (const key of Object.keys(action)) {
+                    const name = actionNames.get(key) || 'Uninstall action ' + JSON.stringify(key) + ':'
+                    const value = action[key]
+                    // Signal actions can contain tuples whose elements need to stay together.
+                    const items = Array.isArray(value) && key !== 'signal' ? value : [value]
+                    for (const item of items) actions.push(name + ' ' + JSON.stringify(item))
+                }
+            }
+        }
+        lines.push('  ' + token)
+        for (const action of actions.length ? actions : ['No detailed uninstall actions reported']) {
+            lines.push('    - ' + action)
+        }
+    }
+    return lines.join('\n')
+}
+JXA
+)
+
+replace_casks() {
+    local cask= target= entry option installed brew record answer REPLY choice_status
+    local plan_marker preview_marker
+    local assume_yes=0 all=0 replaced=0 dry_run=0
+    local -a inventory requested planned removing sudo_flags
+    local -A overrides excluded used
+    while (( $# )); do
+        option=$1
+        shift
+        case $option in
+            --all) all=1 ;;
+            -y|--yes) assume_yes=1 ;;
+            --dry-run) dry_run=1 ;;
+            --label)
+                [[ -z $target ]] || usage_error "Use --label only once"
+                valid_label "${1:-}" || usage_error "--label requires an Installomator label"
+                target=$1
+                shift ;;
+            --exclude)
+                valid_cask "${1:-}" || usage_error "--exclude requires a cask token"
+                excluded[$1]=1
+                shift ;;
+            --map)
+                entry=${1:-}
+                [[ $entry == *=* ]] && valid_cask "${entry%%=*}" && valid_label "${entry#*=}" ||
+                    usage_error "--map requires cask=label"
+                [[ -z ${overrides[${entry%%=*}]} ]] || usage_error "Duplicate mapping for ${entry%%=*}"
+                overrides[${entry%%=*}]=${entry#*=}
+                shift ;;
+            -*) usage_error "Unrecognized replace option: $option" ;;
+            *)
+                valid_cask "$option" || usage_error "Invalid Homebrew cask token"
+                (( ! ${requested[(Ie)$option]} )) || usage_error "Duplicate cask: $option"
+                requested+=("$option") ;;
+        esac
+    done
+    (( ! (dry_run && assume_yes) )) || usage_error "Choose either --dry-run or -y"
+    if (( all )); then
+        (( ! ${#requested} )) && [[ -z $target ]] || usage_error "Use --map with --all"
+    else
+        (( ${#requested} && ! ${#excluded} )) || usage_error "Provide cask tokens or --all. --exclude requires --all"
+        if [[ -n $target ]]; then
+            (( ${#requested} == 1 && ! ${#overrides} )) || usage_error "Use --map for batch label overrides"
+            overrides[${requested[1]}]=$target
+        fi
+    fi
+    for brew in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        [[ -f $brew && -x $brew ]] && break
+    done
+    [[ -f $brew && -x $brew ]] || die "Homebrew was not found in /opt/homebrew/bin or /usr/local/bin."
+    installed=$("$brew" list --cask -1) || die "Could not list installed Homebrew casks."
+    [[ -z $installed ]] || inventory=("${(@f)installed}")
+    for entry in "${(@k)overrides}" "${(@k)excluded}"; do
+        (( ${inventory[(Ie)$entry]} )) || die "Homebrew cask is not installed: $entry."
+    done
+    if (( ! all )); then
+        for cask in "${requested[@]}"; do
+            (( ${inventory[(Ie)$cask]} )) || die "Homebrew cask is not installed: $cask."
+        done
+        for cask in "${(@k)overrides}"; do
+            (( ${requested[(Ie)$cask]} )) || usage_error "Mapping is for an unselected cask: $cask"
+        done
+        inventory=("${requested[@]}")
+    fi
+    load_catalog || return 1
+    set_output_marker 1 32
+    plan_marker=$REPLY
+    set_output_marker 1 33
+    preview_marker=$REPLY
+    for cask in "${inventory[@]}"; do
+        valid_cask "$cask" || { warn "Unsupported cask token: ${(q)cask}"; continue; }
+        if [[ -n ${excluded[$cask]} ]]; then
+            status "Excluded: $cask"
+            continue
+        fi
+        target=${overrides[$cask]:-$cask}
+        if ! valid_label "$target" || ! has_catalog_label "$target" || ! deployment_label_allowed "$target"; then
+            [[ -z ${overrides[$cask]} ]] || die "No deployable Installomator label for $cask: $target."
+            if (( all )); then
+                status "Unmatched: $cask"
+                continue
+            fi
+            (( ${#requested} == 1 )) || die "No exact label for $cask. Add --map $cask=<label>."
+            choice_status=0
+            choose_replacement_label "$cask" "$assume_yes" || choice_status=$?
+            case $choice_status in
+                1) return 1 ;;
+                2) return 0 ;;
+            esac
+            target=$REPLY
+        fi
+        [[ -z ${used[$target]} ]] || die "Both ${used[$target]} and $cask map to $target. Exclude one cask or use a different label."
+        used[$target]=$cask
+        planned+=("$cask=$target")
+        removing+=("$cask")
+        print -r -- "$plan_marker Replace: $cask -> $target"
+    done
+    if (( ! ${#planned} )); then
+        status 'No casks to replace.'
+        return 0
+    fi
+    preview_cask_removals "$brew" "$preview_marker" "${removing[@]}" || warn "Homebrew uninstall details unavailable."
+    if (( dry_run )); then
+        status 'Preview only. No casks were replaced.'
+        return 0
+    fi
+    if (( ! assume_yes )); then
+        if [[ ! -t 0 || ! -t 2 ]]; then
+            status 'Preview only. Pass -y to replace without a prompt.'
+            return 0
+        fi
+        while true; do
+            printf 'Proceed with replacement? [Y/n] ' >&2
+            if ! read -r answer; then
+                print -u2
+                status 'Replacement cancelled.'
+                return 0
+            fi
+            case ${answer:l} in
+                ''|y|yes) break ;;
+                n|no) status 'Replacement cancelled.'; return 0 ;;
+                *) warn 'Please answer yes or no.' ;;
+            esac
+        done
+    fi
+    deployment_ready && load_registry || return 1
+    [[ -t 0 ]] || sudo_flags=(-n)
+    /usr/bin/sudo "${sudo_flags[@]}" -v || die "Could not authorize Installomator before removing any casks."
+    for record in "${planned[@]}"; do
+        migrate_cask "$brew" "${record%%=*}" "${record#*=}" || return $?
+        (( replaced += 1 ))
+    done
+    success "Replaced $replaced Homebrew cask(s)."
+}
+
+upgrade_engine() (
+    local check_only=0 assume_yes=0 option directory release tag latest answer asset_count index
+    local asset_name digest= checksum assessment signature
+    local -a sudo_flags
+    for option in "$@"; do
+        case $option in
+            --check) check_only=1 ;;
+            -y|--yes) assume_yes=1 ;;
+            *) usage_error "Unrecognized upgrade-engine option: $option" ;;
+        esac
+    done
+    (( ! (check_only && assume_yes) )) || usage_error "Choose either --check or -y"
+    inspect_engine || exit 1
+    directory=$(/usr/bin/mktemp -d /private/tmp/io-engine.XXXXXXXX) || exit 1
+    trap '[[ -z $scratch ]] || /bin/rm -f -- "$scratch"; /bin/rm -rf -- "$directory"' EXIT
+    release=$directory/release.json
+    /usr/bin/curl -q --fail --silent --show-error --proto '=https' --connect-timeout 5 --max-time 20 \
+        --max-filesize 1048576 --header 'Accept: application/vnd.github+json' --output "$release" \
+        https://api.github.com/repos/Installomator/Installomator/releases/latest ||
+        die "Could not check the latest Installomator release."
+    tag=$(/usr/bin/plutil -extract tag_name raw -expect string "$release") || die "Missing release tag."
+    local tag_pattern='^v[0-9]+(\.[0-9]+)+$'
+    [[ $tag =~ $tag_pattern &&
+        $(/usr/bin/plutil -extract draft raw -expect bool "$release") == false &&
+        $(/usr/bin/plutil -extract prerelease raw -expect bool "$release") == false ]] ||
+        die "The release metadata does not describe a stable Installomator release."
+    latest=${tag#v}
+    status "Installomator $engine_version installed. Latest stable: $latest."
+    autoload -Uz is-at-least
+    if is-at-least "$latest" "$engine_version"; then
+        success 'No upgrade needed.'
+        exit 0
+    fi
+    (( ! check_only )) || exit 0
+    [[ $engine == "$default_engine" ]] && /usr/sbin/pkgutil --pkg-info com.scriptingosx.Installomator >/dev/null 2>&1 ||
+        die "In-place upgrades require the official package installation at $default_engine."
+    trusted_path "$engine" || die "The installed engine path does not pass ownership and permissions checks."
+    if (( ! assume_yes )); then
+        if [[ ! -t 0 || ! -t 2 ]]; then
+            status 'Check only. Pass -y to upgrade without a prompt.'
+            exit 0
+        fi
+        printf 'Download and install Installomator %s? [y/N] ' "$latest" >&2
+        if ! read -r answer || [[ ${answer:l} != y && ${answer:l} != yes ]]; then
+            status 'Upgrade cancelled.'
+            exit 0
+        fi
+    fi
+    asset_count=$(/usr/bin/plutil -extract assets raw -expect array "$release") || die "Missing release assets."
+    for (( index = 0; index < asset_count; index++ )); do
+        asset_name=$(/usr/bin/plutil -extract "assets.$index.name" raw -expect string "$release") || continue
+        [[ $asset_name == "Installomator-$latest.pkg" ]] || continue
+        [[ -z $digest ]] || die "Multiple Installomator package assets matched the release."
+        digest=$(/usr/bin/plutil -extract "assets.$index.digest" raw -expect string "$release") ||
+            die "The package is missing a release checksum."
+    done
+    local digest_pattern='^sha256:[0-9a-f]{64}$'
+    [[ $digest =~ $digest_pattern ]] || die "Missing or invalid Installomator package checksum."
+    local package=$directory/Installomator.pkg
+    local -a transfer_display=(--silent)
+    if [[ -t 2 && ${TERM:-dumb} != dumb ]]; then
+        transfer_display=(--progress-bar)
+    fi
+    progress "Downloading Installomator $latest"
+    /usr/bin/curl -q --fail "${transfer_display[@]}" --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 5 --max-time 120 --max-filesize 52428800 --output "$package" \
+        "https://github.com/Installomator/Installomator/releases/download/$tag/Installomator-$latest.pkg" ||
+        die "Could not download the Installomator package."
+    progress 'Verifying Installomator package'
+    checksum=$(/usr/bin/shasum -a 256 "$package") || die "Could not hash the Installomator package."
+    [[ ${checksum%% *} == ${digest#sha256:} ]] || die "Installomator package checksum mismatch."
+    assessment=$(/usr/sbin/spctl --assess --type install --verbose=4 "$package" 2>&1) &&
+        [[ $assessment == *'source=Notarized Developer ID'* ]] &&
+        signature=$(/usr/sbin/pkgutil --check-signature "$package") &&
+        /usr/bin/grep -Eq '^[[:blank:]]+1\. Developer ID Installer: .+ \(JME5BW3F3R\)$' <<< "$signature" ||
+        die "Installomator package failed notarization or Developer ID verification."
+    [[ -t 0 ]] || sudo_flags=(-n)
+    progress "Installing Installomator $latest"
+    /usr/bin/sudo "${sudo_flags[@]}" -- /usr/sbin/installer -pkg "$package" -target / ||
+        die "Installomator package installation failed."
+    inspect_engine && [[ $engine_version == "$latest" ]] ||
+        die "The package installer finished, but the expected version was not found at $engine."
+    success "Installomator upgraded to $engine_version."
+    load_catalog 1 || warn "The engine was upgraded. Run io refresh to retry catalog refresh."
+)
+
+(( $# )) || { help_text >&2; exit 2; }
+command_name=$1
+shift
+case $command_name in
+    help|--help|-h|version|--version|available|refresh|doctor)
+        (( $# == 0 )) || usage_error "$command_name takes no arguments" ;;
+    list)
+        [[ $# == 0 || ( $# == 1 && $1 == --installed ) ]] || usage_error "Usage: io list [--installed]" ;;
+    outdated)
+        (( $# <= 1 )) || usage_error "Usage: io outdated [label]"
+        if (( $# )); then valid_label "${1:l}" || usage_error "Invalid or reserved application label"; fi ;;
+    install)
+        (( $# )) || usage_error "Usage: io install <label> …" ;;
+    search|info|add|remove|update)
+        (( $# == 1 )) || usage_error "$command_name requires one argument" ;;
+    replace|upgrade-engine) ;;
+    -*)
+        usage_error "Unrecognized option" ;;
+    *)
+        (( $# == 0 )) || usage_error "Unrecognized command"
+        set -- "$command_name"
+        command_name=install ;;
+esac
+case $command_name in
+    help|--help|-h) help_text; exit 0 ;;
+    search) [[ -n $1 ]] || usage_error "Search query is empty" ;;
+    install)
+        typeset -a install_labels
+        for label in "$@"; do
+            label=${label:l}
+            valid_label "$label" || usage_error "Invalid or reserved application label"
+            install_labels+=("$label")
+        done
+        install_labels=("${(@u)install_labels}")
+        ;;
+    info|add|remove|update)
+        label=${1:l}
+        if [[ $command_name != update || $label != --all ]]; then
+            valid_label "$label" || usage_error "Invalid or reserved application label"
+        fi
+        ;;
+esac
+
+(( EUID != 0 )) || die "Run io as your regular user. It invokes sudo when deploying applications."
+[[ $config_dir == /* && $cache_dir == /* ]] || die "XDG directories must be absolute paths."
+case $command_name in
+    list|remove) ;;
+    *) load_config ;;
+esac
+case $command_name in
+    outdated)
+        report_installed outdated "${1:l}"
+        exit $? ;;
+    replace)
+        replace_casks "$@"
+        exit $? ;;
+    upgrade-engine)
+        upgrade_engine "$@"
+        exit $? ;;
+    version|--version)
+        IFS= read -r io_version < "$prefix/VERSION" || die "Cannot read the io version."
+        status "io $io_version"
+        inspect_engine || exit 1
+        status "Installomator $engine_version"
+        ;;
+    doctor)
+        status "Config: $config_dir/config"
+        status "Registry: $registry"
+        status "Catalog cache: $cache"
+        result=0
+        if deployment_ready; then
+            success "Installomator $engine_version: $engine"
+        else
+            result=1
+        fi
+        if load_registry; then
+            status "${#registered} registered application(s)."
+        else
+            result=1
+        fi
+        if [[ -e $cache || -L $cache ]]; then
+            header=
+            if [[ -f $cache && -r $cache ]]; then
+                IFS= read -r header < "$cache"
+            fi
+            if [[ ( $header == 'local '* || $header == 'upstream '* ) ]] && read_catalog "$cache" "$header"; then
+                status "${#labels} cached labels. Run io refresh to rebuild the cache."
+            else
+                error "Invalid catalog cache. Run io refresh."
+                result=1
+            fi
+        else
+            status "Catalog cache has yet to be created."
+        fi
+        exit "$result"
+        ;;
+    list)
+        if [[ ${1:-} == --installed ]]; then
+            load_config
+            report_installed list
+            exit $?
+        fi
+        load_registry || exit 1
+        if [[ -t 1 ]]; then
+            printf '%-24s %s\n' LABEL STATUS
+            for label in "${registered[@]}"; do printf '%-24s %s\n' "$label" Registered; done
+            print
+            status "${#registered} registered application(s)."
+        elif (( ${#registered} )); then
+            print -rl -- "${registered[@]}"
+        fi
+        ;;
+    remove)
+        change_registry remove "$label" || die "Could not update the registry."
+        success "$label: Deregistered."
+        ;;
+    refresh)
+        load_catalog 1 || exit 1
+        success "${#labels} labels from $catalog_source."
+        ;;
+    install)
+        deployment_ready && load_catalog && load_registry || exit 1
+        for label in "${install_labels[@]}"; do
+            has_catalog_label "$label" || die "Unknown application label: $label."
+        done
+        if (( ${#install_labels} == 1 )); then
+            deploy_app "${install_labels[1]}"
+        else
+            deploy_batch "${install_labels[@]}"
+        fi
+        exit $? ;;
+    search|available|info|add)
+        load_catalog || exit 1
+        case $command_name in
+            available) print -rl -- "${labels[@]}" ;;
+            search)
+                query=${1:l}
+                found=1
+                for label in "${labels[@]}"; do
+                    if [[ $label == *"$query"* ]]; then
+                        print -r -- "$label"
+                        found=0
+                    fi
+                done
+                exit "$found"
+                ;;
+            *)
+                has_catalog_label "$label" || die "Unknown application label: $label."
+                case $command_name in
+                    info)
+                        load_registry || exit 1
+                        status "Label: $label"
+                        status "Catalog: $catalog_source"
+                        if has_registered_label "$label"; then
+                            status 'Registry: Registered'
+                        else
+                            status 'Registry: Unregistered'
+                        fi
+                        ;;
+                    add)
+                        change_registry add "$label" || die "Could not update the registry."
+                        success "$label: Registered."
+                        ;;
+                esac
+                ;;
+        esac
+        ;;
+    update)
+        load_registry || exit 1
+        if [[ $label != --all ]]; then
+            has_registered_label "$label" || die "$label is not registered. Use io add or io install."
+        elif (( ! ${#registered} )); then
+            status 'No registered applications.'
+            exit 0
+        fi
+        deployment_ready && load_catalog || exit 1
+        if [[ $label != --all ]]; then
+            run_engine "$label"
+            exit $?
+        fi
+        deploy_batch "${registered[@]}"
+        exit $?
+        ;;
+esac
+exit 0

@@ -1,0 +1,67 @@
+#!/bin/zsh -f
+VERSION="10.10"
+
+# This catalog is read as text by io. The fixture itself performs no deployment.
+if false; then
+case $label in
+# label descriptions start here
+brave|\
+brave-alias|brave-other)
+    name="Fixture Brave"
+    ;;
+same-download)
+    ;;
+adobereaderdc)
+    ;;
+current)
+    name="Fixture Current"
+    ;;
+rectangle)
+    name="Fixture Rectangle"
+    ;;
+blocked)
+    ;;
+broken)
+    ;;
+badlabel)
+    ;;
+unexpected)
+    ;;
+ambiguous)
+    ;;
+ringcentralapp)
+    ;;
+ringcentralphone)
+    ;;
+visualstudiocode)
+    ;;
+*)
+    ;;
+esac
+fi
+
+label=$1
+shift
+[[ $# == 5 && $1 == DEBUG=0 && $2 == NOTIFY=silent &&
+   $3 == BLOCKING_PROCESS_ACTION=silent_fail && $4 == INSTALL= &&
+   $5 == LOGGING=INFO ]] || exit 91
+
+case $label in
+    brave|brave-alias)
+        print -r -- "2026-11-25 12:00:00 : REQ   : $label : Downloading fixture.dmg"
+        print -r -- "2026-11-25 12:00:00 : REQ   : $label : Installing Fixture"
+        print -r -- "2026-11-25 12:00:00 : INFO  : $label : Verifying: fixture.dmg"
+        print -r -- "2026-11-25 12:00:00 : REQ   : $label : Installing Fixture again"
+        print -r -- "2026-11-25 12:00:00 : REQ   : $label : All done!" ;;
+    current)
+        print -r -- "2026-11-25 12:00:00 : REQ   : $label : No newer version." ;;
+    same-download)
+        print -r -- "2026-11-25 12:00:00 : INFO  : $label : Downloaded version of Fixture is 200.59 on versionKey CFBundleVersion, same as installed." ;;
+    ambiguous)
+        print -r -- "2026-11-25 12:00:00 : REQ   : $label : type is updateronly so we end here." ;;
+    blocked) exit 12 ;;
+    broken) print -u2 'download failed'; exit 2 ;;
+    badlabel) exit 1 ;;
+    unexpected) exit 42 ;;
+    *) exit 1 ;;
+esac
